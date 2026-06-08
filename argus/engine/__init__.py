@@ -1,26 +1,23 @@
-from argus.session import TraceLogger
-from argus.evals import write_eval
-from argus.judge import evaluate_session_outputs
-from argus.engine import (
+from argus.engine.eval_engine import (
     EvalResult,
-    Incident,
     run_all_evals,
+    run_and_persist as run_evals_and_persist,
+)
+from argus.engine.pattern_detector import (
+    Incident,
     run_all_detectors,
     run_quality_detectors,
-    run_evals_and_persist,
-    run_detectors_and_persist,
     compute_shadow_cb_fires,
+    run_and_persist as run_detectors_and_persist,
+)
+from argus.engine.rca_engine import (
     build_annotated_call_stack,
     generate_fix_suggestion,
     summarize_incident,
 )
 
 __all__ = [
-    # logging + L4/L5 evals
-    "TraceLogger",
-    "write_eval",
-    "evaluate_session_outputs",
-    # L3 operational evals
+    # eval engine
     "EvalResult",
     "run_all_evals",
     "run_evals_and_persist",
@@ -30,9 +27,8 @@ __all__ = [
     "run_quality_detectors",
     "compute_shadow_cb_fires",
     "run_detectors_and_persist",
-    # RCA
+    # rca engine
     "build_annotated_call_stack",
     "generate_fix_suggestion",
     "summarize_incident",
 ]
-__version__ = "0.2.0"
