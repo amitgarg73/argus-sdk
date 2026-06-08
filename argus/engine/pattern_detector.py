@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from collections import Counter
 
-from argus.engine.eval_engine import EvalResult, REQUIRED_AGENTS, COST_ANOMALY_SIGMA
+from argus.engine.eval_engine import EvalResult
 
 
 def _real_error(v) -> str | None:
@@ -22,18 +22,36 @@ def _real_error(v) -> str | None:
     s = str(v).strip()
     return s if s else None
 
-TOOL_RETRY_THRESHOLD      = 3
-CONTEXT_SPIRAL_TOKENS     = 40_000
-COST_ANOMALY_SIGMA_INC    = COST_ANOMALY_SIGMA
+TOOL_RETRY_THRESHOLD       = 3
+CONTEXT_SPIRAL_TOKENS      = 40_000
+COST_ANOMALY_SIGMA         = 2.0
+COST_ANOMALY_SIGMA_INC     = COST_ANOMALY_SIGMA
 HYPERACTIVE_POLL_THRESHOLD = 6
-FABRICATION_LATENCY_MS    = 50
-FABRICATION_MIN_COUNT     = 2
-_HTTP_ERROR_CODES         = {"400", "401", "403", "429", "500", "502", "503"}
+FABRICATION_LATENCY_MS     = 50
+FABRICATION_MIN_COUNT      = 2
+_HTTP_ERROR_CODES          = {"400", "401", "403", "429", "500", "502", "503"}
 
 CB_CONFIG: dict[str, list[tuple[str, float]]] = {
     "research": [("tool_success_rate", 0.80), ("completion", 0.70)],
     "risk":     [("assessment_complete", 1.0)],
 }
+
+_DETECTOR_DEFAULTS: dict = {
+    "tool_retry_threshold":       TOOL_RETRY_THRESHOLD,
+    "token_spiral_threshold":     CONTEXT_SPIRAL_TOKENS,
+    "hyperactive_poll_threshold": HYPERACTIVE_POLL_THRESHOLD,
+    "fabrication_latency_ms":     FABRICATION_LATENCY_MS,
+    "fabrication_min_count":      FABRICATION_MIN_COUNT,
+    "cost_anomaly_sigma":         COST_ANOMALY_SIGMA_INC,
+    "cb_config":                  CB_CONFIG,
+}
+
+
+def _build_detector_config(pipeline_config: dict | None) -> dict:
+    cfg = dict(_DETECTOR_DEFAULTS)
+    if pipeline_config:
+        cfg.update(pipeline_config)
+    return cfg
 
 
 @dataclass
@@ -89,9 +107,10 @@ def _trace_to_stack_frame(t: dict) -> dict:
 # ── Individual pattern detectors ──────────────────────────────────────────────
 
 def detect_tool_timeout_loop(
-    session: dict, traces: list[dict], evals: list[EvalResult]
+    session: dict, traces: list[dict], evals: list[EvalResult], *,
+    retry_threshold: int = TOOL_RETRY_THRESHOLD,
 ) -> Incident | None:
-    """Fires when the same tool_name has 3+ error traces."""
+    """Fires when the same tool_name has retry_threshold+ error traces."""
     tool_errors: dict[str, list[dict]] = {}
     for t in sorted(traces, key=lambda x: x.get("created_at", "")):
         if (t.get("step_type") or "") == "tool_call" and (
@@ -101,7 +120,7 @@ def detect_tool_timeout_loop(
             tool_errors.setdefault(tool, []).append(t)
 
     for tool_name, errors in tool_errors.items():
-        if len(errors) >= TOOL_RETRY_THRESHOLD:
+        if len(errors) >= retry_threshold:
             session_id = session.get("id", "")
             cost       = float(session.get("total_cost_usd") or 0)
             tokens     = int((session.get("total_tokens_input") or 0) +
@@ -130,21 +149,24 @@ def detect_tool_timeout_loop(
 
 
 def detect_context_spiral(
-    session: dict, traces: list[dict], evals: list[EvalResult]
+    session: dict, traces: list[dict], evals: list[EvalResult], *,
+    spiral_tokens: int = CONTEXT_SPIRAL_TOKENS,
+    analysis_agent: str = "research",
 ) -> Incident | None:
-    """Fires when research agent burns > 40K tokens with 0 trades executed."""
-    research_tokens = sum(
+    """Fires when analysis_agent burns > spiral_tokens tokens with 0 trades executed."""
+    agent_lower = analysis_agent.lower()
+    agent_tokens = sum(
         (t.get("tokens_input") or 0) + (t.get("tokens_output") or 0)
         for t in traces
-        if (t.get("agent") or "").lower() == "research"
+        if (t.get("agent") or "").lower() == agent_lower
     )
     trades = int(session.get("trades_executed") or 0)
 
-    if research_tokens > CONTEXT_SPIRAL_TOKENS and trades == 0:
-        session_id = session.get("id", "")
-        cost       = float(session.get("total_cost_usd") or 0)
-        research_traces = sorted(
-            [t for t in traces if (t.get("agent") or "").lower() == "research"],
+    if agent_tokens > spiral_tokens and trades == 0:
+        session_id   = session.get("id", "")
+        cost         = float(session.get("total_cost_usd") or 0)
+        agent_traces = sorted(
+            [t for t in traces if (t.get("agent") or "").lower() == agent_lower],
             key=lambda x: x.get("created_at", "")
         )
         return Incident(
@@ -152,17 +174,17 @@ def detect_context_spiral(
             pattern_name = "Context Spiral",
             severity     = "warning",
             root_cause   = (
-                f"Research agent consumed {research_tokens:,} tokens "
+                f"{analysis_agent.capitalize()} agent consumed {agent_tokens:,} tokens "
                 f"with 0 trades produced. Agent gathered context "
                 f"without reaching a decision."
             ),
-            call_stack   = [_trace_to_stack_frame(t) for t in research_traces[-20:]],
+            call_stack   = [_trace_to_stack_frame(t) for t in agent_traces[-20:]],
             failed_evals = _failed_eval_rows(evals),
             cost_wasted  = cost,
-            tokens_wasted= research_tokens,
+            tokens_wasted= agent_tokens,
             fix_suggestion = (
-                "Add a hard token budget to the research agent "
-                f"(e.g. max_tokens={CONTEXT_SPIRAL_TOKENS // 2}). "
+                f"Add a hard token budget to the {analysis_agent} agent "
+                f"(e.g. max_tokens={spiral_tokens // 2}). "
                 "Force a decision step if budget is reached without a recommendation."
             ),
         )
@@ -170,42 +192,53 @@ def detect_context_spiral(
 
 
 def detect_pipeline_break(
-    session: dict, traces: list[dict], evals: list[EvalResult]
+    session: dict, traces: list[dict], evals: list[EvalResult],
+    pipeline_order: list[str] | None = None,
 ) -> Incident | None:
-    """Fires when research agent ran but orchestrator did not."""
-    agents_seen = {(t.get("agent") or "").lower() for t in traces}
-    if "market_shadow" in agents_seen:
-        agents_seen.add("market")
+    """Fires when the first agent in pipeline_order ran but the last agent did not."""
+    order = [a.lower() for a in (pipeline_order or ["research", "orchestrator"])]
+    if len(order) < 2:
+        return None
+    first_agent = order[0]
+    last_agent  = order[-1]
 
-    research_ran     = "research" in agents_seen
-    orchestrator_ran = "orchestrator" in agents_seen
+    agents_seen: set[str] = {(t.get("agent") or "").lower() for t in traces}
+    # expand shadow/prefixed agent names (e.g. market_shadow → market)
+    expanded = set(agents_seen)
+    for name in agents_seen:
+        for agent in order:
+            if name.startswith(agent + "_") or name == agent + "_shadow":
+                expanded.add(agent)
 
-    if research_ran and not orchestrator_ran:
-        session_id     = session.get("id", "")
-        cost           = float(session.get("total_cost_usd") or 0)
-        research_traces = sorted(
-            [t for t in traces if (t.get("agent") or "").lower() == "research"],
+    first_ran = first_agent in expanded
+    last_ran  = last_agent in expanded
+
+    if first_ran and not last_ran:
+        session_id    = session.get("id", "")
+        cost          = float(session.get("total_cost_usd") or 0)
+        first_traces  = sorted(
+            [t for t in traces if (t.get("agent") or "").lower() == first_agent],
             key=lambda x: x.get("created_at", "")
         )
-        last_research = research_traces[-1] if research_traces else {}
+        last_first = first_traces[-1] if first_traces else {}
         return Incident(
             session_id   = session_id,
             pattern_name = "Pipeline Break",
             severity     = "critical",
             root_cause   = (
-                f"Research agent completed but orchestrator never started. "
-                f"Last research step: {last_research.get('step_type', 'unknown')} "
-                f"(outcome: {last_research.get('outcome', 'unknown')})"
+                f"{first_agent.capitalize()} agent completed but {last_agent} never started. "
+                f"Last {first_agent} step: {last_first.get('step_type', 'unknown')} "
+                f"(outcome: {last_first.get('outcome', 'unknown')})"
             ),
-            call_stack   = [_trace_to_stack_frame(t) for t in research_traces[-10:]],
+            call_stack   = [_trace_to_stack_frame(t) for t in first_traces[-10:]],
             failed_evals = _failed_eval_rows(evals),
             cost_wasted  = cost,
             tokens_wasted= int((session.get("total_tokens_input") or 0) +
                                (session.get("total_tokens_output") or 0)),
             fix_suggestion = (
-                "Check for uncaught exceptions between research and orchestrator steps. "
-                "Add try/except around the research -> orchestrator handoff. "
-                "Ensure research agent errors are propagated, not silently swallowed."
+                f"Check for uncaught exceptions between {first_agent} and {last_agent} steps. "
+                f"Add try/except around the {first_agent} -> {last_agent} handoff. "
+                f"Ensure {first_agent} agent errors are propagated, not silently swallowed."
             ),
         )
     return None
@@ -213,9 +246,10 @@ def detect_pipeline_break(
 
 def detect_cost_anomaly(
     session: dict, traces: list[dict], evals: list[EvalResult],
-    recent_costs: list[float] | None = None,
+    recent_costs: list[float] | None = None, *,
+    anomaly_sigma: float = COST_ANOMALY_SIGMA_INC,
 ) -> Incident | None:
-    """Fires when session cost > mean + 2 sigma of recent sessions."""
+    """Fires when session cost > mean + anomaly_sigma * stdev of recent sessions."""
     if not recent_costs or len(recent_costs) < 5:
         return None
 
@@ -224,7 +258,7 @@ def detect_cost_anomaly(
     stdev = statistics.stdev(recent_costs) if len(recent_costs) > 1 else 0
     z     = (cost - mean) / stdev if stdev > 0 else 0
 
-    if z > COST_ANOMALY_SIGMA_INC:
+    if z > anomaly_sigma:
         session_id = session.get("id", "")
         sorted_traces = sorted(traces, key=lambda x: x.get("created_at", ""))
         return Incident(
@@ -288,9 +322,10 @@ def detect_silent_exit(
 
 
 def detect_empty_result_loop(
-    session: dict, traces: list[dict], evals: list[EvalResult]
+    session: dict, traces: list[dict], evals: list[EvalResult], *,
+    retry_threshold: int = TOOL_RETRY_THRESHOLD,
 ) -> Incident | None:
-    """Fires when same tool is called 3+ times successfully but session still fails."""
+    """Fires when same tool is called retry_threshold+ times successfully but session fails."""
     tool_calls = [
         t for t in traces
         if (t.get("step_type") or "") == "tool_call"
@@ -300,7 +335,7 @@ def detect_empty_result_loop(
     trades      = int(session.get("trades_executed") or 0)
 
     for tool_name, count in tool_counts.items():
-        if count >= TOOL_RETRY_THRESHOLD and trades == 0:
+        if count >= retry_threshold and trades == 0:
             session_id = session.get("id", "")
             relevant   = [t for t in tool_calls if t.get("tool_name") == tool_name]
             return Incident(
@@ -327,9 +362,10 @@ def detect_empty_result_loop(
 
 
 def detect_hyperactive_polling(
-    session: dict, traces: list[dict], evals: list[EvalResult]
+    session: dict, traces: list[dict], evals: list[EvalResult], *,
+    poll_threshold: int = HYPERACTIVE_POLL_THRESHOLD,
 ) -> Incident | None:
-    """Fires when the same tool is called 6+ times successfully in one session."""
+    """Fires when the same tool is called poll_threshold+ times successfully in one session."""
     tool_success: dict[str, list[dict]] = {}
     for t in sorted(traces, key=lambda x: x.get("created_at", "")):
         if (t.get("step_type") or "") == "tool_call" and t.get("outcome") != "error":
@@ -337,7 +373,7 @@ def detect_hyperactive_polling(
             tool_success.setdefault(name, []).append(t)
 
     for tool_name, calls in tool_success.items():
-        if len(calls) >= HYPERACTIVE_POLL_THRESHOLD:
+        if len(calls) >= poll_threshold:
             session_id = session.get("id", "")
             agent = calls[0].get("agent", "unknown")
             total_latency = sum(c.get("latency_ms") or 0 for c in calls)
@@ -365,16 +401,18 @@ def detect_hyperactive_polling(
 
 
 def detect_tool_fabrication(
-    session: dict, traces: list[dict], evals: list[EvalResult]
+    session: dict, traces: list[dict], evals: list[EvalResult], *,
+    fab_latency_ms: float = FABRICATION_LATENCY_MS,
+    fab_min_count: int = FABRICATION_MIN_COUNT,
 ) -> Incident | None:
-    """Fires when 2+ tool_call traces complete in under 50ms (real APIs take 100ms+)."""
+    """Fires when fab_min_count+ tool_call traces complete in under fab_latency_ms."""
     suspects = [
         t for t in traces
         if (t.get("step_type") or "") == "tool_call"
         and t.get("outcome") != "error"
-        and 0 < (t.get("latency_ms") or 0) < FABRICATION_LATENCY_MS
+        and 0 < (t.get("latency_ms") or 0) < fab_latency_ms
     ]
-    if len(suspects) >= FABRICATION_MIN_COUNT:
+    if len(suspects) >= fab_min_count:
         session_id = session.get("id", "")
         agents = list({t.get("agent", "unknown") for t in suspects})
         tools  = list({t.get("tool_name", "unknown") for t in suspects})
@@ -383,7 +421,7 @@ def detect_tool_fabrication(
             pattern_name  = "Tool Call Fabrication",
             severity      = "critical",
             root_cause    = (
-                f"{len(suspects)} tool call(s) completed in under {FABRICATION_LATENCY_MS}ms "
+                f"{len(suspects)} tool call(s) completed in under {fab_latency_ms}ms "
                 f"with success status. External API calls take 100ms+. "
                 f"Affected agents: {agents}. Tools: {tools}."
             ),
@@ -402,61 +440,69 @@ def detect_tool_fabrication(
 
 
 def detect_handoff_schema_break(
-    session: dict, traces: list[dict], evals: list[EvalResult]
+    session: dict, traces: list[dict], evals: list[EvalResult],
+    handoff_pairs: list[list[str]] | None = None,
 ) -> Incident | None:
-    """Fires when research completes successfully but the risk agent's first trace is an error."""
+    """Fires when source agent completes but target agent's first trace is an error."""
+    pairs = handoff_pairs or [["research", "risk"]]
     sorted_traces = sorted(traces, key=lambda x: x.get("created_at", ""))
 
-    research_traces = [t for t in sorted_traces
-                       if (t.get("agent") or "").lower().startswith("research")]
-    risk_traces     = [t for t in sorted_traces
-                       if (t.get("agent") or "").lower() == "risk"]
+    for pair in pairs:
+        if len(pair) < 2:
+            continue
+        src, tgt = pair[0].lower(), pair[1].lower()
 
-    if not research_traces or not risk_traces:
-        return None
+        src_traces = [t for t in sorted_traces
+                      if (t.get("agent") or "").lower().startswith(src)]
+        tgt_traces = [t for t in sorted_traces
+                      if (t.get("agent") or "").lower() == tgt]
 
-    research_ok = any(
-        (t.get("step_type") or "") in ("llm_call", "agent_message", "decision")
-        and t.get("outcome") != "error"
-        for t in research_traces
-    )
-    if not research_ok:
-        return None
+        if not src_traces or not tgt_traces:
+            continue
 
-    first_risk = risk_traces[0]
-    risk_errored = (
-        first_risk.get("outcome") == "error"
-        or bool(_real_error(first_risk.get("error")))
-    )
-    if not risk_errored:
-        return None
+        src_ok = any(
+            (t.get("step_type") or "") in ("llm_call", "agent_message", "decision")
+            and t.get("outcome") != "error"
+            for t in src_traces
+        )
+        if not src_ok:
+            continue
 
-    session_id = session.get("id", "")
-    err_msg    = first_risk.get("error") or "unknown schema error"
-    return Incident(
-        session_id    = session_id,
-        pattern_name  = "Handoff Schema Break",
-        severity      = "critical",
-        root_cause    = (
-            f"Research agent completed successfully but risk agent errored on its "
-            f"first trace. Research output did not match risk agent's expected schema. "
-            f"Error at handoff: {str(err_msg)[:120]}"
-        ),
-        call_stack    = (
-            [_trace_to_stack_frame(t) for t in research_traces[-5:]]
-            + [_trace_to_stack_frame(first_risk)]
-        ),
-        failed_evals  = _failed_eval_rows(evals),
-        cost_wasted   = float(session.get("total_cost_usd") or 0),
-        tokens_wasted = int((session.get("total_tokens_input") or 0) +
-                            (session.get("total_tokens_output") or 0)),
-        fix_suggestion = (
-            "Add schema validation at the research -> risk handoff. "
-            "Define a typed contract (Pydantic model or TypedDict) for what research "
-            "must return before passing to risk. Fail fast with a clear error if the "
-            "contract is violated, rather than letting risk agent crash on bad input."
-        ),
-    )
+        first_tgt   = tgt_traces[0]
+        tgt_errored = (
+            first_tgt.get("outcome") == "error"
+            or bool(_real_error(first_tgt.get("error")))
+        )
+        if not tgt_errored:
+            continue
+
+        session_id = session.get("id", "")
+        err_msg    = first_tgt.get("error") or "unknown schema error"
+        return Incident(
+            session_id    = session_id,
+            pattern_name  = "Handoff Schema Break",
+            severity      = "critical",
+            root_cause    = (
+                f"{src.capitalize()} agent completed successfully but {tgt} agent errored on its "
+                f"first trace. {src.capitalize()} output did not match {tgt} agent's expected schema. "
+                f"Error at handoff: {str(err_msg)[:120]}"
+            ),
+            call_stack    = (
+                [_trace_to_stack_frame(t) for t in src_traces[-5:]]
+                + [_trace_to_stack_frame(first_tgt)]
+            ),
+            failed_evals  = _failed_eval_rows(evals),
+            cost_wasted   = float(session.get("total_cost_usd") or 0),
+            tokens_wasted = int((session.get("total_tokens_input") or 0) +
+                                (session.get("total_tokens_output") or 0)),
+            fix_suggestion = (
+                f"Add schema validation at the {src} -> {tgt} handoff. "
+                f"Define a typed contract (Pydantic model or TypedDict) for what {src} "
+                f"must return before passing to {tgt}. Fail fast with a clear error if the "
+                f"contract is violated, rather than letting {tgt} agent crash on bad input."
+            ),
+        )
+    return None
 
 
 def detect_error_misinterpretation(
@@ -792,13 +838,17 @@ def run_quality_detectors(
     return incidents
 
 
-def compute_shadow_cb_fires(evals: list[EvalResult]) -> list[dict]:
-    """Return list of shadow CB fire events based on CB_CONFIG thresholds."""
+def compute_shadow_cb_fires(
+    evals: list[EvalResult],
+    cb_config: dict | None = None,
+) -> list[dict]:
+    """Return list of shadow CB fire events based on cb_config thresholds."""
+    config = cb_config if cb_config is not None else CB_CONFIG
     fires = []
     for e in evals:
-        if e.agent not in CB_CONFIG:
+        if e.agent not in config:
             continue
-        for eval_name, threshold in CB_CONFIG[e.agent]:
+        for eval_name, threshold in config[e.agent]:
             if e.eval_name == eval_name and e.score < threshold:
                 fires.append({
                     "agent":      e.agent,
@@ -828,18 +878,45 @@ def run_all_detectors(
     session: dict,
     traces: list[dict],
     evals: list[EvalResult],
+    pipeline_config: dict | None = None,
     recent_costs: list[float] | None = None,
 ) -> list[Incident]:
+    """
+    Run all pattern detectors. Pass pipeline_config (from load_pipeline_config()) to use
+    workflow-specific thresholds; omit to use module defaults.
+    """
+    cfg            = _build_detector_config(pipeline_config)
+    retry_thresh   = int(cfg["tool_retry_threshold"])
+    spiral_tok     = int(cfg["token_spiral_threshold"])
+    poll_thresh    = int(cfg["hyperactive_poll_threshold"])
+    fab_lat        = float(cfg["fabrication_latency_ms"])
+    fab_min        = int(cfg["fabrication_min_count"])
+    anomaly_sig    = float(cfg["cost_anomaly_sigma"])
+    analysis_agent = str(cfg.get("analysis_agent", "research"))
+    pipeline_order = list(cfg.get("pipeline_order", ["research", "orchestrator"]))
+    handoff_pairs  = list(cfg.get("handoff_pairs",  [["research", "risk"]]))
+
     incidents: list[Incident] = []
-    for detector in DETECTORS:
+    for detector, kwargs in [
+        (detect_tool_timeout_loop,   {"retry_threshold": retry_thresh}),
+        (detect_context_spiral,      {"spiral_tokens": spiral_tok, "analysis_agent": analysis_agent}),
+        (detect_pipeline_break,      {"pipeline_order": pipeline_order}),
+        (detect_empty_result_loop,   {"retry_threshold": retry_thresh}),
+        (detect_silent_exit,         {}),
+        (detect_hyperactive_polling, {"poll_threshold": poll_thresh}),
+        (detect_tool_fabrication,    {"fab_latency_ms": fab_lat, "fab_min_count": fab_min}),
+        (detect_handoff_schema_break,    {"handoff_pairs": handoff_pairs}),
+        (detect_error_misinterpretation, {}),
+    ]:
         try:
-            result = detector(session, traces, evals)
+            result = detector(session, traces, evals, **kwargs)
             if result:
                 incidents.append(result)
         except Exception:
             pass
     try:
-        result = detect_cost_anomaly(session, traces, evals, recent_costs)
+        result = detect_cost_anomaly(session, traces, evals, recent_costs,
+                                     anomaly_sigma=anomaly_sig)
         if result:
             incidents.append(result)
     except Exception:
@@ -851,12 +928,13 @@ def run_and_persist(
     session: dict,
     traces: list[dict],
     evals: list[EvalResult],
+    pipeline_config: dict | None = None,
     recent_costs: list[float] | None = None,
     db=None,
     tenant_id: str = "",
 ) -> list[Incident]:
     """Run all detectors and write incidents to ag_incidents if db is provided."""
-    incidents = run_all_detectors(session, traces, evals, recent_costs)
+    incidents = run_all_detectors(session, traces, evals, pipeline_config, recent_costs)
     if db and incidents:
         rows = [i.to_db_row() for i in incidents]
         if tenant_id:

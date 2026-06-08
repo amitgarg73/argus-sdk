@@ -4,7 +4,7 @@ from argus.judge import evaluate_session_outputs
 from argus.engine import (
     EvalResult,
     Incident,
-    run_all_evals,
+    run_evals_from_config,
     run_all_detectors,
     run_quality_detectors,
     run_evals_and_persist,
@@ -13,6 +13,11 @@ from argus.engine import (
     build_annotated_call_stack,
     generate_fix_suggestion,
     summarize_incident,
+    load_pipeline_config,
+    load_eval_configs,
+    load_pipeline_agents,
+    register_eval,
+    get_registry,
 )
 
 __all__ = [
@@ -22,8 +27,10 @@ __all__ = [
     "evaluate_session_outputs",
     # L3 operational evals
     "EvalResult",
-    "run_all_evals",
+    "run_evals_from_config",
     "run_evals_and_persist",
+    "register_eval",
+    "get_registry",
     # pattern detector
     "Incident",
     "run_all_detectors",
@@ -34,5 +41,9 @@ __all__ = [
     "build_annotated_call_stack",
     "generate_fix_suggestion",
     "summarize_incident",
+    # config loaders
+    "load_pipeline_config",
+    "load_eval_configs",
+    "load_pipeline_agents",
 ]
-__version__ = "0.2.0"
+__version__ = "0.3.0"
