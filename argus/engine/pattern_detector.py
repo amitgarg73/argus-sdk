@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from collections import Counter
 
-from argus.engine.eval_engine import EvalResult, REQUIRED_AGENTS, COST_ANOMALY_SIGMA
+from argus.engine.eval_engine import EvalResult
 
 
 def _real_error(v) -> str | None:
@@ -24,6 +24,7 @@ def _real_error(v) -> str | None:
 
 TOOL_RETRY_THRESHOLD       = 3
 CONTEXT_SPIRAL_TOKENS      = 40_000
+COST_ANOMALY_SIGMA         = 2.0
 COST_ANOMALY_SIGMA_INC     = COST_ANOMALY_SIGMA
 HYPERACTIVE_POLL_THRESHOLD = 6
 FABRICATION_LATENCY_MS     = 50
@@ -150,20 +151,22 @@ def detect_tool_timeout_loop(
 def detect_context_spiral(
     session: dict, traces: list[dict], evals: list[EvalResult], *,
     spiral_tokens: int = CONTEXT_SPIRAL_TOKENS,
+    analysis_agent: str = "research",
 ) -> Incident | None:
-    """Fires when research agent burns > spiral_tokens tokens with 0 trades executed."""
-    research_tokens = sum(
+    """Fires when analysis_agent burns > spiral_tokens tokens with 0 trades executed."""
+    agent_lower = analysis_agent.lower()
+    agent_tokens = sum(
         (t.get("tokens_input") or 0) + (t.get("tokens_output") or 0)
         for t in traces
-        if (t.get("agent") or "").lower() == "research"
+        if (t.get("agent") or "").lower() == agent_lower
     )
     trades = int(session.get("trades_executed") or 0)
 
-    if research_tokens > spiral_tokens and trades == 0:
-        session_id = session.get("id", "")
-        cost       = float(session.get("total_cost_usd") or 0)
-        research_traces = sorted(
-            [t for t in traces if (t.get("agent") or "").lower() == "research"],
+    if agent_tokens > spiral_tokens and trades == 0:
+        session_id   = session.get("id", "")
+        cost         = float(session.get("total_cost_usd") or 0)
+        agent_traces = sorted(
+            [t for t in traces if (t.get("agent") or "").lower() == agent_lower],
             key=lambda x: x.get("created_at", "")
         )
         return Incident(
@@ -171,16 +174,16 @@ def detect_context_spiral(
             pattern_name = "Context Spiral",
             severity     = "warning",
             root_cause   = (
-                f"Research agent consumed {research_tokens:,} tokens "
+                f"{analysis_agent.capitalize()} agent consumed {agent_tokens:,} tokens "
                 f"with 0 trades produced. Agent gathered context "
                 f"without reaching a decision."
             ),
-            call_stack   = [_trace_to_stack_frame(t) for t in research_traces[-20:]],
+            call_stack   = [_trace_to_stack_frame(t) for t in agent_traces[-20:]],
             failed_evals = _failed_eval_rows(evals),
             cost_wasted  = cost,
-            tokens_wasted= research_tokens,
+            tokens_wasted= agent_tokens,
             fix_suggestion = (
-                "Add a hard token budget to the research agent "
+                f"Add a hard token budget to the {analysis_agent} agent "
                 f"(e.g. max_tokens={spiral_tokens // 2}). "
                 "Force a decision step if budget is reached without a recommendation."
             ),
@@ -189,42 +192,53 @@ def detect_context_spiral(
 
 
 def detect_pipeline_break(
-    session: dict, traces: list[dict], evals: list[EvalResult]
+    session: dict, traces: list[dict], evals: list[EvalResult],
+    pipeline_order: list[str] | None = None,
 ) -> Incident | None:
-    """Fires when research agent ran but orchestrator did not."""
-    agents_seen = {(t.get("agent") or "").lower() for t in traces}
-    if "market_shadow" in agents_seen:
-        agents_seen.add("market")
+    """Fires when the first agent in pipeline_order ran but the last agent did not."""
+    order = [a.lower() for a in (pipeline_order or ["research", "orchestrator"])]
+    if len(order) < 2:
+        return None
+    first_agent = order[0]
+    last_agent  = order[-1]
 
-    research_ran     = "research" in agents_seen
-    orchestrator_ran = "orchestrator" in agents_seen
+    agents_seen: set[str] = {(t.get("agent") or "").lower() for t in traces}
+    # expand shadow/prefixed agent names (e.g. market_shadow → market)
+    expanded = set(agents_seen)
+    for name in agents_seen:
+        for agent in order:
+            if name.startswith(agent + "_") or name == agent + "_shadow":
+                expanded.add(agent)
 
-    if research_ran and not orchestrator_ran:
-        session_id     = session.get("id", "")
-        cost           = float(session.get("total_cost_usd") or 0)
-        research_traces = sorted(
-            [t for t in traces if (t.get("agent") or "").lower() == "research"],
+    first_ran = first_agent in expanded
+    last_ran  = last_agent in expanded
+
+    if first_ran and not last_ran:
+        session_id    = session.get("id", "")
+        cost          = float(session.get("total_cost_usd") or 0)
+        first_traces  = sorted(
+            [t for t in traces if (t.get("agent") or "").lower() == first_agent],
             key=lambda x: x.get("created_at", "")
         )
-        last_research = research_traces[-1] if research_traces else {}
+        last_first = first_traces[-1] if first_traces else {}
         return Incident(
             session_id   = session_id,
             pattern_name = "Pipeline Break",
             severity     = "critical",
             root_cause   = (
-                f"Research agent completed but orchestrator never started. "
-                f"Last research step: {last_research.get('step_type', 'unknown')} "
-                f"(outcome: {last_research.get('outcome', 'unknown')})"
+                f"{first_agent.capitalize()} agent completed but {last_agent} never started. "
+                f"Last {first_agent} step: {last_first.get('step_type', 'unknown')} "
+                f"(outcome: {last_first.get('outcome', 'unknown')})"
             ),
-            call_stack   = [_trace_to_stack_frame(t) for t in research_traces[-10:]],
+            call_stack   = [_trace_to_stack_frame(t) for t in first_traces[-10:]],
             failed_evals = _failed_eval_rows(evals),
             cost_wasted  = cost,
             tokens_wasted= int((session.get("total_tokens_input") or 0) +
                                (session.get("total_tokens_output") or 0)),
             fix_suggestion = (
-                "Check for uncaught exceptions between research and orchestrator steps. "
-                "Add try/except around the research -> orchestrator handoff. "
-                "Ensure research agent errors are propagated, not silently swallowed."
+                f"Check for uncaught exceptions between {first_agent} and {last_agent} steps. "
+                f"Add try/except around the {first_agent} -> {last_agent} handoff. "
+                f"Ensure {first_agent} agent errors are propagated, not silently swallowed."
             ),
         )
     return None
@@ -426,61 +440,69 @@ def detect_tool_fabrication(
 
 
 def detect_handoff_schema_break(
-    session: dict, traces: list[dict], evals: list[EvalResult]
+    session: dict, traces: list[dict], evals: list[EvalResult],
+    handoff_pairs: list[list[str]] | None = None,
 ) -> Incident | None:
-    """Fires when research completes successfully but the risk agent's first trace is an error."""
+    """Fires when source agent completes but target agent's first trace is an error."""
+    pairs = handoff_pairs or [["research", "risk"]]
     sorted_traces = sorted(traces, key=lambda x: x.get("created_at", ""))
 
-    research_traces = [t for t in sorted_traces
-                       if (t.get("agent") or "").lower().startswith("research")]
-    risk_traces     = [t for t in sorted_traces
-                       if (t.get("agent") or "").lower() == "risk"]
+    for pair in pairs:
+        if len(pair) < 2:
+            continue
+        src, tgt = pair[0].lower(), pair[1].lower()
 
-    if not research_traces or not risk_traces:
-        return None
+        src_traces = [t for t in sorted_traces
+                      if (t.get("agent") or "").lower().startswith(src)]
+        tgt_traces = [t for t in sorted_traces
+                      if (t.get("agent") or "").lower() == tgt]
 
-    research_ok = any(
-        (t.get("step_type") or "") in ("llm_call", "agent_message", "decision")
-        and t.get("outcome") != "error"
-        for t in research_traces
-    )
-    if not research_ok:
-        return None
+        if not src_traces or not tgt_traces:
+            continue
 
-    first_risk = risk_traces[0]
-    risk_errored = (
-        first_risk.get("outcome") == "error"
-        or bool(_real_error(first_risk.get("error")))
-    )
-    if not risk_errored:
-        return None
+        src_ok = any(
+            (t.get("step_type") or "") in ("llm_call", "agent_message", "decision")
+            and t.get("outcome") != "error"
+            for t in src_traces
+        )
+        if not src_ok:
+            continue
 
-    session_id = session.get("id", "")
-    err_msg    = first_risk.get("error") or "unknown schema error"
-    return Incident(
-        session_id    = session_id,
-        pattern_name  = "Handoff Schema Break",
-        severity      = "critical",
-        root_cause    = (
-            f"Research agent completed successfully but risk agent errored on its "
-            f"first trace. Research output did not match risk agent's expected schema. "
-            f"Error at handoff: {str(err_msg)[:120]}"
-        ),
-        call_stack    = (
-            [_trace_to_stack_frame(t) for t in research_traces[-5:]]
-            + [_trace_to_stack_frame(first_risk)]
-        ),
-        failed_evals  = _failed_eval_rows(evals),
-        cost_wasted   = float(session.get("total_cost_usd") or 0),
-        tokens_wasted = int((session.get("total_tokens_input") or 0) +
-                            (session.get("total_tokens_output") or 0)),
-        fix_suggestion = (
-            "Add schema validation at the research -> risk handoff. "
-            "Define a typed contract (Pydantic model or TypedDict) for what research "
-            "must return before passing to risk. Fail fast with a clear error if the "
-            "contract is violated, rather than letting risk agent crash on bad input."
-        ),
-    )
+        first_tgt   = tgt_traces[0]
+        tgt_errored = (
+            first_tgt.get("outcome") == "error"
+            or bool(_real_error(first_tgt.get("error")))
+        )
+        if not tgt_errored:
+            continue
+
+        session_id = session.get("id", "")
+        err_msg    = first_tgt.get("error") or "unknown schema error"
+        return Incident(
+            session_id    = session_id,
+            pattern_name  = "Handoff Schema Break",
+            severity      = "critical",
+            root_cause    = (
+                f"{src.capitalize()} agent completed successfully but {tgt} agent errored on its "
+                f"first trace. {src.capitalize()} output did not match {tgt} agent's expected schema. "
+                f"Error at handoff: {str(err_msg)[:120]}"
+            ),
+            call_stack    = (
+                [_trace_to_stack_frame(t) for t in src_traces[-5:]]
+                + [_trace_to_stack_frame(first_tgt)]
+            ),
+            failed_evals  = _failed_eval_rows(evals),
+            cost_wasted   = float(session.get("total_cost_usd") or 0),
+            tokens_wasted = int((session.get("total_tokens_input") or 0) +
+                                (session.get("total_tokens_output") or 0)),
+            fix_suggestion = (
+                f"Add schema validation at the {src} -> {tgt} handoff. "
+                f"Define a typed contract (Pydantic model or TypedDict) for what {src} "
+                f"must return before passing to {tgt}. Fail fast with a clear error if the "
+                f"contract is violated, rather than letting {tgt} agent crash on bad input."
+            ),
+        )
+    return None
 
 
 def detect_error_misinterpretation(
@@ -863,24 +885,27 @@ def run_all_detectors(
     Run all pattern detectors. Pass pipeline_config (from load_pipeline_config()) to use
     workflow-specific thresholds; omit to use module defaults.
     """
-    cfg          = _build_detector_config(pipeline_config)
-    retry_thresh = int(cfg["tool_retry_threshold"])
-    spiral_tok   = int(cfg["token_spiral_threshold"])
-    poll_thresh  = int(cfg["hyperactive_poll_threshold"])
-    fab_lat      = float(cfg["fabrication_latency_ms"])
-    fab_min      = int(cfg["fabrication_min_count"])
-    anomaly_sig  = float(cfg["cost_anomaly_sigma"])
+    cfg            = _build_detector_config(pipeline_config)
+    retry_thresh   = int(cfg["tool_retry_threshold"])
+    spiral_tok     = int(cfg["token_spiral_threshold"])
+    poll_thresh    = int(cfg["hyperactive_poll_threshold"])
+    fab_lat        = float(cfg["fabrication_latency_ms"])
+    fab_min        = int(cfg["fabrication_min_count"])
+    anomaly_sig    = float(cfg["cost_anomaly_sigma"])
+    analysis_agent = str(cfg.get("analysis_agent", "research"))
+    pipeline_order = list(cfg.get("pipeline_order", ["research", "orchestrator"]))
+    handoff_pairs  = list(cfg.get("handoff_pairs",  [["research", "risk"]]))
 
     incidents: list[Incident] = []
     for detector, kwargs in [
         (detect_tool_timeout_loop,   {"retry_threshold": retry_thresh}),
-        (detect_context_spiral,      {"spiral_tokens": spiral_tok}),
-        (detect_pipeline_break,      {}),
+        (detect_context_spiral,      {"spiral_tokens": spiral_tok, "analysis_agent": analysis_agent}),
+        (detect_pipeline_break,      {"pipeline_order": pipeline_order}),
         (detect_empty_result_loop,   {"retry_threshold": retry_thresh}),
         (detect_silent_exit,         {}),
         (detect_hyperactive_polling, {"poll_threshold": poll_thresh}),
         (detect_tool_fabrication,    {"fab_latency_ms": fab_lat, "fab_min_count": fab_min}),
-        (detect_handoff_schema_break,    {}),
+        (detect_handoff_schema_break,    {"handoff_pairs": handoff_pairs}),
         (detect_error_misinterpretation, {}),
     ]:
         try:

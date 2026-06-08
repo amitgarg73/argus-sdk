@@ -1,7 +1,9 @@
 from argus.engine.eval_engine import (
     EvalResult,
-    run_all_evals,
+    run_evals_from_config,
     run_and_persist as run_evals_and_persist,
+    register_eval,
+    get_registry,
 )
 from argus.engine.pattern_detector import (
     Incident,
@@ -15,13 +17,15 @@ from argus.engine.rca_engine import (
     generate_fix_suggestion,
     summarize_incident,
 )
-from argus.engine.loader import load_pipeline_config
+from argus.engine.loader import load_pipeline_config, load_eval_configs, load_pipeline_agents
 
 __all__ = [
     # eval engine
     "EvalResult",
-    "run_all_evals",
+    "run_evals_from_config",
     "run_evals_and_persist",
+    "register_eval",
+    "get_registry",
     # pattern detector
     "Incident",
     "run_all_detectors",
@@ -32,6 +36,8 @@ __all__ = [
     "build_annotated_call_stack",
     "generate_fix_suggestion",
     "summarize_incident",
-    # config loader
+    # config loaders
     "load_pipeline_config",
+    "load_eval_configs",
+    "load_pipeline_agents",
 ]
