@@ -13,6 +13,7 @@ from argus.engine import (
     build_annotated_call_stack,
     generate_fix_suggestion,
     summarize_incident,
+    load_pipeline_config,
 )
 
 __all__ = [
@@ -34,5 +35,7 @@ __all__ = [
     "build_annotated_call_stack",
     "generate_fix_suggestion",
     "summarize_incident",
+    # config loader
+    "load_pipeline_config",
 ]
-__version__ = "0.2.0"
+__version__ = "0.3.0"

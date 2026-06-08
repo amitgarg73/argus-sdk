@@ -22,18 +22,35 @@ def _real_error(v) -> str | None:
     s = str(v).strip()
     return s if s else None
 
-TOOL_RETRY_THRESHOLD      = 3
-CONTEXT_SPIRAL_TOKENS     = 40_000
-COST_ANOMALY_SIGMA_INC    = COST_ANOMALY_SIGMA
+TOOL_RETRY_THRESHOLD       = 3
+CONTEXT_SPIRAL_TOKENS      = 40_000
+COST_ANOMALY_SIGMA_INC     = COST_ANOMALY_SIGMA
 HYPERACTIVE_POLL_THRESHOLD = 6
-FABRICATION_LATENCY_MS    = 50
-FABRICATION_MIN_COUNT     = 2
-_HTTP_ERROR_CODES         = {"400", "401", "403", "429", "500", "502", "503"}
+FABRICATION_LATENCY_MS     = 50
+FABRICATION_MIN_COUNT      = 2
+_HTTP_ERROR_CODES          = {"400", "401", "403", "429", "500", "502", "503"}
 
 CB_CONFIG: dict[str, list[tuple[str, float]]] = {
     "research": [("tool_success_rate", 0.80), ("completion", 0.70)],
     "risk":     [("assessment_complete", 1.0)],
 }
+
+_DETECTOR_DEFAULTS: dict = {
+    "tool_retry_threshold":       TOOL_RETRY_THRESHOLD,
+    "token_spiral_threshold":     CONTEXT_SPIRAL_TOKENS,
+    "hyperactive_poll_threshold": HYPERACTIVE_POLL_THRESHOLD,
+    "fabrication_latency_ms":     FABRICATION_LATENCY_MS,
+    "fabrication_min_count":      FABRICATION_MIN_COUNT,
+    "cost_anomaly_sigma":         COST_ANOMALY_SIGMA_INC,
+    "cb_config":                  CB_CONFIG,
+}
+
+
+def _build_detector_config(pipeline_config: dict | None) -> dict:
+    cfg = dict(_DETECTOR_DEFAULTS)
+    if pipeline_config:
+        cfg.update(pipeline_config)
+    return cfg
 
 
 @dataclass
@@ -89,9 +106,10 @@ def _trace_to_stack_frame(t: dict) -> dict:
 # ── Individual pattern detectors ──────────────────────────────────────────────
 
 def detect_tool_timeout_loop(
-    session: dict, traces: list[dict], evals: list[EvalResult]
+    session: dict, traces: list[dict], evals: list[EvalResult], *,
+    retry_threshold: int = TOOL_RETRY_THRESHOLD,
 ) -> Incident | None:
-    """Fires when the same tool_name has 3+ error traces."""
+    """Fires when the same tool_name has retry_threshold+ error traces."""
     tool_errors: dict[str, list[dict]] = {}
     for t in sorted(traces, key=lambda x: x.get("created_at", "")):
         if (t.get("step_type") or "") == "tool_call" and (
@@ -101,7 +119,7 @@ def detect_tool_timeout_loop(
             tool_errors.setdefault(tool, []).append(t)
 
     for tool_name, errors in tool_errors.items():
-        if len(errors) >= TOOL_RETRY_THRESHOLD:
+        if len(errors) >= retry_threshold:
             session_id = session.get("id", "")
             cost       = float(session.get("total_cost_usd") or 0)
             tokens     = int((session.get("total_tokens_input") or 0) +
@@ -130,9 +148,10 @@ def detect_tool_timeout_loop(
 
 
 def detect_context_spiral(
-    session: dict, traces: list[dict], evals: list[EvalResult]
+    session: dict, traces: list[dict], evals: list[EvalResult], *,
+    spiral_tokens: int = CONTEXT_SPIRAL_TOKENS,
 ) -> Incident | None:
-    """Fires when research agent burns > 40K tokens with 0 trades executed."""
+    """Fires when research agent burns > spiral_tokens tokens with 0 trades executed."""
     research_tokens = sum(
         (t.get("tokens_input") or 0) + (t.get("tokens_output") or 0)
         for t in traces
@@ -140,7 +159,7 @@ def detect_context_spiral(
     )
     trades = int(session.get("trades_executed") or 0)
 
-    if research_tokens > CONTEXT_SPIRAL_TOKENS and trades == 0:
+    if research_tokens > spiral_tokens and trades == 0:
         session_id = session.get("id", "")
         cost       = float(session.get("total_cost_usd") or 0)
         research_traces = sorted(
@@ -162,7 +181,7 @@ def detect_context_spiral(
             tokens_wasted= research_tokens,
             fix_suggestion = (
                 "Add a hard token budget to the research agent "
-                f"(e.g. max_tokens={CONTEXT_SPIRAL_TOKENS // 2}). "
+                f"(e.g. max_tokens={spiral_tokens // 2}). "
                 "Force a decision step if budget is reached without a recommendation."
             ),
         )
@@ -213,9 +232,10 @@ def detect_pipeline_break(
 
 def detect_cost_anomaly(
     session: dict, traces: list[dict], evals: list[EvalResult],
-    recent_costs: list[float] | None = None,
+    recent_costs: list[float] | None = None, *,
+    anomaly_sigma: float = COST_ANOMALY_SIGMA_INC,
 ) -> Incident | None:
-    """Fires when session cost > mean + 2 sigma of recent sessions."""
+    """Fires when session cost > mean + anomaly_sigma * stdev of recent sessions."""
     if not recent_costs or len(recent_costs) < 5:
         return None
 
@@ -224,7 +244,7 @@ def detect_cost_anomaly(
     stdev = statistics.stdev(recent_costs) if len(recent_costs) > 1 else 0
     z     = (cost - mean) / stdev if stdev > 0 else 0
 
-    if z > COST_ANOMALY_SIGMA_INC:
+    if z > anomaly_sigma:
         session_id = session.get("id", "")
         sorted_traces = sorted(traces, key=lambda x: x.get("created_at", ""))
         return Incident(
@@ -288,9 +308,10 @@ def detect_silent_exit(
 
 
 def detect_empty_result_loop(
-    session: dict, traces: list[dict], evals: list[EvalResult]
+    session: dict, traces: list[dict], evals: list[EvalResult], *,
+    retry_threshold: int = TOOL_RETRY_THRESHOLD,
 ) -> Incident | None:
-    """Fires when same tool is called 3+ times successfully but session still fails."""
+    """Fires when same tool is called retry_threshold+ times successfully but session fails."""
     tool_calls = [
         t for t in traces
         if (t.get("step_type") or "") == "tool_call"
@@ -300,7 +321,7 @@ def detect_empty_result_loop(
     trades      = int(session.get("trades_executed") or 0)
 
     for tool_name, count in tool_counts.items():
-        if count >= TOOL_RETRY_THRESHOLD and trades == 0:
+        if count >= retry_threshold and trades == 0:
             session_id = session.get("id", "")
             relevant   = [t for t in tool_calls if t.get("tool_name") == tool_name]
             return Incident(
@@ -327,9 +348,10 @@ def detect_empty_result_loop(
 
 
 def detect_hyperactive_polling(
-    session: dict, traces: list[dict], evals: list[EvalResult]
+    session: dict, traces: list[dict], evals: list[EvalResult], *,
+    poll_threshold: int = HYPERACTIVE_POLL_THRESHOLD,
 ) -> Incident | None:
-    """Fires when the same tool is called 6+ times successfully in one session."""
+    """Fires when the same tool is called poll_threshold+ times successfully in one session."""
     tool_success: dict[str, list[dict]] = {}
     for t in sorted(traces, key=lambda x: x.get("created_at", "")):
         if (t.get("step_type") or "") == "tool_call" and t.get("outcome") != "error":
@@ -337,7 +359,7 @@ def detect_hyperactive_polling(
             tool_success.setdefault(name, []).append(t)
 
     for tool_name, calls in tool_success.items():
-        if len(calls) >= HYPERACTIVE_POLL_THRESHOLD:
+        if len(calls) >= poll_threshold:
             session_id = session.get("id", "")
             agent = calls[0].get("agent", "unknown")
             total_latency = sum(c.get("latency_ms") or 0 for c in calls)
@@ -365,16 +387,18 @@ def detect_hyperactive_polling(
 
 
 def detect_tool_fabrication(
-    session: dict, traces: list[dict], evals: list[EvalResult]
+    session: dict, traces: list[dict], evals: list[EvalResult], *,
+    fab_latency_ms: float = FABRICATION_LATENCY_MS,
+    fab_min_count: int = FABRICATION_MIN_COUNT,
 ) -> Incident | None:
-    """Fires when 2+ tool_call traces complete in under 50ms (real APIs take 100ms+)."""
+    """Fires when fab_min_count+ tool_call traces complete in under fab_latency_ms."""
     suspects = [
         t for t in traces
         if (t.get("step_type") or "") == "tool_call"
         and t.get("outcome") != "error"
-        and 0 < (t.get("latency_ms") or 0) < FABRICATION_LATENCY_MS
+        and 0 < (t.get("latency_ms") or 0) < fab_latency_ms
     ]
-    if len(suspects) >= FABRICATION_MIN_COUNT:
+    if len(suspects) >= fab_min_count:
         session_id = session.get("id", "")
         agents = list({t.get("agent", "unknown") for t in suspects})
         tools  = list({t.get("tool_name", "unknown") for t in suspects})
@@ -383,7 +407,7 @@ def detect_tool_fabrication(
             pattern_name  = "Tool Call Fabrication",
             severity      = "critical",
             root_cause    = (
-                f"{len(suspects)} tool call(s) completed in under {FABRICATION_LATENCY_MS}ms "
+                f"{len(suspects)} tool call(s) completed in under {fab_latency_ms}ms "
                 f"with success status. External API calls take 100ms+. "
                 f"Affected agents: {agents}. Tools: {tools}."
             ),
@@ -792,13 +816,17 @@ def run_quality_detectors(
     return incidents
 
 
-def compute_shadow_cb_fires(evals: list[EvalResult]) -> list[dict]:
-    """Return list of shadow CB fire events based on CB_CONFIG thresholds."""
+def compute_shadow_cb_fires(
+    evals: list[EvalResult],
+    cb_config: dict | None = None,
+) -> list[dict]:
+    """Return list of shadow CB fire events based on cb_config thresholds."""
+    config = cb_config if cb_config is not None else CB_CONFIG
     fires = []
     for e in evals:
-        if e.agent not in CB_CONFIG:
+        if e.agent not in config:
             continue
-        for eval_name, threshold in CB_CONFIG[e.agent]:
+        for eval_name, threshold in config[e.agent]:
             if e.eval_name == eval_name and e.score < threshold:
                 fires.append({
                     "agent":      e.agent,
@@ -828,18 +856,42 @@ def run_all_detectors(
     session: dict,
     traces: list[dict],
     evals: list[EvalResult],
+    pipeline_config: dict | None = None,
     recent_costs: list[float] | None = None,
 ) -> list[Incident]:
+    """
+    Run all pattern detectors. Pass pipeline_config (from load_pipeline_config()) to use
+    workflow-specific thresholds; omit to use module defaults.
+    """
+    cfg          = _build_detector_config(pipeline_config)
+    retry_thresh = int(cfg["tool_retry_threshold"])
+    spiral_tok   = int(cfg["token_spiral_threshold"])
+    poll_thresh  = int(cfg["hyperactive_poll_threshold"])
+    fab_lat      = float(cfg["fabrication_latency_ms"])
+    fab_min      = int(cfg["fabrication_min_count"])
+    anomaly_sig  = float(cfg["cost_anomaly_sigma"])
+
     incidents: list[Incident] = []
-    for detector in DETECTORS:
+    for detector, kwargs in [
+        (detect_tool_timeout_loop,   {"retry_threshold": retry_thresh}),
+        (detect_context_spiral,      {"spiral_tokens": spiral_tok}),
+        (detect_pipeline_break,      {}),
+        (detect_empty_result_loop,   {"retry_threshold": retry_thresh}),
+        (detect_silent_exit,         {}),
+        (detect_hyperactive_polling, {"poll_threshold": poll_thresh}),
+        (detect_tool_fabrication,    {"fab_latency_ms": fab_lat, "fab_min_count": fab_min}),
+        (detect_handoff_schema_break,    {}),
+        (detect_error_misinterpretation, {}),
+    ]:
         try:
-            result = detector(session, traces, evals)
+            result = detector(session, traces, evals, **kwargs)
             if result:
                 incidents.append(result)
         except Exception:
             pass
     try:
-        result = detect_cost_anomaly(session, traces, evals, recent_costs)
+        result = detect_cost_anomaly(session, traces, evals, recent_costs,
+                                     anomaly_sigma=anomaly_sig)
         if result:
             incidents.append(result)
     except Exception:
@@ -851,12 +903,13 @@ def run_and_persist(
     session: dict,
     traces: list[dict],
     evals: list[EvalResult],
+    pipeline_config: dict | None = None,
     recent_costs: list[float] | None = None,
     db=None,
     tenant_id: str = "",
 ) -> list[Incident]:
     """Run all detectors and write incidents to ag_incidents if db is provided."""
-    incidents = run_all_detectors(session, traces, evals, recent_costs)
+    incidents = run_all_detectors(session, traces, evals, pipeline_config, recent_costs)
     if db and incidents:
         rows = [i.to_db_row() for i in incidents]
         if tenant_id:

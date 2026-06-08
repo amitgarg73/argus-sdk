@@ -15,6 +15,7 @@ from argus.engine.rca_engine import (
     generate_fix_suggestion,
     summarize_incident,
 )
+from argus.engine.loader import load_pipeline_config
 
 __all__ = [
     # eval engine
@@ -31,4 +32,6 @@ __all__ = [
     "build_annotated_call_stack",
     "generate_fix_suggestion",
     "summarize_incident",
+    # config loader
+    "load_pipeline_config",
 ]
