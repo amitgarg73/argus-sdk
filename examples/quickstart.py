@@ -34,6 +34,18 @@ tracer.log_agent_message(
     model="claude-haiku-4-5-20251001",
 )
 
+# If an agent is skipped, log why — Argus uses this to distinguish
+# intentional routing (gray) from upstream errors (amber).
+#
+#   Design skip: expected routing, no alarm
+#     tracer.log_skip("risk", reason="no_proposals", skip_type="design")
+#
+#   Error skip: upstream failure caused the skip
+#     tracer.log_skip("risk", reason="upstream_data_missing", skip_type="error")
+#
+# Without log_skip(), Argus still detects the agent as skipped but
+# cannot tell whether it was intentional or caused by an error.
+
 # Close the session
 tracer.close_session("completed", result_summary="Research complete — 3 frameworks identified")
 
