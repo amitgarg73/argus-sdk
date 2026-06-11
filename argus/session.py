@@ -151,6 +151,31 @@ class TraceLogger:
             "model":       model,
         })
 
+    def log_skip(
+        self,
+        agent: str,
+        reason: str,
+        skip_type: str = "design",
+    ) -> str:
+        """
+        Record that an agent was intentionally skipped.
+
+        Args:
+            agent:     Base agent name (e.g. 'news', 'risk').
+            reason:    Human-readable reason (e.g. 'no_candidates', 'upstream_data_missing').
+            skip_type: 'design'  — expected routing (no alarm in Argus).
+                       'error'   — upstream failure caused the skip (shown as amber in Argus).
+
+        Returns span_id. Argus uses this to distinguish intentional routing
+        from error propagation in the session diagnosis and agents list.
+        """
+        return self._write({
+            "step_type": "skip",
+            "agent":     agent,
+            "outcome":   "skipped",
+            "payload":   {"reason": reason, "skip_type": skip_type},
+        })
+
     def log_error(
         self,
         agent: str,
@@ -304,6 +329,7 @@ class TraceLogger:
         if fields.get("tool_input")      is not None: payload["tool_input"]      = fields["tool_input"]
         if fields.get("tool_output")     is not None: payload["tool_output"]     = fields["tool_output"]
         if fields.get("agent_reasoning") is not None: payload["agent_reasoning"] = fields["agent_reasoning"]
+        if fields.get("payload")         is not None: payload.update(fields["payload"])
 
         row: dict[str, Any] = {
             "tenant_id":     self._tenant_id,
