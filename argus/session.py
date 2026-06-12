@@ -55,6 +55,7 @@ class TraceLogger:
         tracer.close_session("completed", result_summary="3 trades executed")
 
     Environment variables required:
+        ARGUS_URL      — your Argus deployment URL (e.g. https://argusobs.vercel.app); enables instant diagnosis + embeddings on session close
         SUPABASE_URL   — your Supabase project URL
         SUPABASE_KEY   — your Supabase service role key
         TENANT_ID      — your Argus tenant UUID (from Settings)
@@ -281,6 +282,7 @@ class TraceLogger:
             })
 
         get_client().table("ag_sessions").update(row).eq("id", self.session_id).execute()
+        self._trigger_argus_compute()
 
     def get_sequence(self) -> int:
         return self._sequence
@@ -289,6 +291,38 @@ class TraceLogger:
         return self._agent_spans.get(agent)
 
     # ── Private ─────────────────────────────────────────────────────────────────
+
+    def _trigger_argus_compute(self) -> None:
+        """Fire-and-forget: trigger diagnosis + embeddings on Argus immediately after close.
+        Requires ARGUS_URL env var. No-op if unset."""
+        import threading
+        import json
+        import urllib.request
+
+        argus_url = _load_env("ARGUS_URL").rstrip("/")
+        if not argus_url or not self._tenant_id or not self._workflow_id:
+            return
+
+        payload = json.dumps({
+            "session_id":  self.session_id,
+            "tenant_id":   self._tenant_id,
+            "workflow_id": self._workflow_id,
+        }).encode()
+
+        def _post(path: str) -> None:
+            try:
+                req = urllib.request.Request(
+                    f"{argus_url}{path}",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                urllib.request.urlopen(req, timeout=30)
+            except Exception:
+                pass  # non-fatal
+
+        threading.Thread(target=_post, args=("/api/compute/diagnoses",), daemon=True).start()
+        threading.Thread(target=_post, args=("/api/compute/embeddings",), daemon=True).start()
 
     def _insert_session_stub(self) -> None:
         from argus.db import get_client
