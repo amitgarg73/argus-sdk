@@ -86,7 +86,7 @@ class Incident:
 def _failed_eval_rows(evals: list[EvalResult]) -> list[dict]:
     return [
         {"agent": e.agent, "eval_name": e.eval_name,
-         "score": e.score, "threshold": e.threshold}
+         "score": e.score, "threshold": e.threshold, "role": "cause"}
         for e in evals if not e.passed
     ]
 

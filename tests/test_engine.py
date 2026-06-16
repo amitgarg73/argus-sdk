@@ -492,6 +492,18 @@ class TestRunAllDetectors:
                     "fix_suggestion", "is_simulated"}
         assert required.issubset(incidents[0].to_db_row().keys())
 
+    def test_failed_evals_include_role_cause(self):
+        # Every failed_eval entry must have role='cause' so the Argus UI can render
+        # the call chain without needing quality attribution data.
+        sess      = _session(trades_executed=0, terminal_reason="error")
+        incidents = run_all_detectors(sess, _timeout_traces(), [])
+        for inc in incidents:
+            for entry in inc.failed_evals:
+                if isinstance(entry, dict) and "eval_name" in entry:
+                    assert entry.get("role") == "cause", (
+                        f"failed_eval entry missing role='cause' in {inc.pattern_name}: {entry}"
+                    )
+
     def test_context_spiral_uses_analysis_agent_config(self):
         spiral_traces = [
             {"agent": "analyser", "step_type": "llm_call", "tool_name": None,
