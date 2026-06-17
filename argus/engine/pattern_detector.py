@@ -27,8 +27,15 @@ CONTEXT_SPIRAL_TOKENS      = 40_000
 COST_ANOMALY_SIGMA         = 2.0
 COST_ANOMALY_SIGMA_INC     = COST_ANOMALY_SIGMA
 HYPERACTIVE_POLL_THRESHOLD = 6
-FABRICATION_LATENCY_MS     = 50
-FABRICATION_MIN_COUNT      = 2
+FABRICATION_LATENCY_MS     = 10   # lowered from 50ms: true mocks return in <10ms; Alpaca snapshots, DB queries, and pre-market guards legitimately complete in 10–50ms
+FABRICATION_MIN_COUNT      = 3    # raised from 2: reduces noise from isolated fast calls
+
+# Tools that read/write a local database — these complete in <50ms by design and
+# should never trigger the fabrication detector regardless of latency.
+FABRICATION_EXEMPT_TOOLS: frozenset[str] = frozenset({
+    "read_session_context", "write_learning", "get_candidates",
+    "get_position_history", "filter_and_rank", "get_scan_results",
+})
 _HTTP_ERROR_CODES          = {"400", "401", "403", "429", "500", "502", "503"}
 
 CB_CONFIG: dict[str, list[tuple[str, float]]] = {
@@ -42,6 +49,7 @@ _DETECTOR_DEFAULTS: dict = {
     "hyperactive_poll_threshold": HYPERACTIVE_POLL_THRESHOLD,
     "fabrication_latency_ms":     FABRICATION_LATENCY_MS,
     "fabrication_min_count":      FABRICATION_MIN_COUNT,
+    "fabrication_exempt_tools":   FABRICATION_EXEMPT_TOOLS,
     "cost_anomaly_sigma":         COST_ANOMALY_SIGMA_INC,
     "cb_config":                  CB_CONFIG,
 }
@@ -404,13 +412,23 @@ def detect_tool_fabrication(
     session: dict, traces: list[dict], evals: list[EvalResult], *,
     fab_latency_ms: float = FABRICATION_LATENCY_MS,
     fab_min_count: int = FABRICATION_MIN_COUNT,
+    exempt_tools: frozenset[str] = FABRICATION_EXEMPT_TOOLS,
 ) -> Incident | None:
-    """Fires when fab_min_count+ tool_call traces complete in under fab_latency_ms."""
+    """
+    Fires when fab_min_count+ tool_call traces complete in under fab_latency_ms.
+
+    Exempt tools: database operations (read_session_context, write_learning, etc.)
+    complete in <50ms by design and are excluded regardless of latency.
+
+    Threshold is 10ms (not 50ms): true mock/cached responses return near-instantly;
+    real external APIs, even fast ones (Alpaca snapshots), take 10ms+ under normal load.
+    """
     suspects = [
         t for t in traces
         if (t.get("step_type") or "") == "tool_call"
         and t.get("outcome") != "error"
         and 0 < (t.get("latency_ms") or 0) < fab_latency_ms
+        and (t.get("tool_name") or "") not in exempt_tools
     ]
     if len(suspects) >= fab_min_count:
         session_id = session.get("id", "")
@@ -891,6 +909,7 @@ def run_all_detectors(
     poll_thresh    = int(cfg["hyperactive_poll_threshold"])
     fab_lat        = float(cfg["fabrication_latency_ms"])
     fab_min        = int(cfg["fabrication_min_count"])
+    fab_exempt     = frozenset(cfg.get("fabrication_exempt_tools", FABRICATION_EXEMPT_TOOLS))
     anomaly_sig    = float(cfg["cost_anomaly_sigma"])
     analysis_agent = str(cfg.get("analysis_agent", "research"))
     pipeline_order = list(cfg.get("pipeline_order", ["research", "orchestrator"]))
@@ -904,7 +923,7 @@ def run_all_detectors(
         (detect_empty_result_loop,   {"retry_threshold": retry_thresh}),
         (detect_silent_exit,         {}),
         (detect_hyperactive_polling, {"poll_threshold": poll_thresh}),
-        (detect_tool_fabrication,    {"fab_latency_ms": fab_lat, "fab_min_count": fab_min}),
+        (detect_tool_fabrication,    {"fab_latency_ms": fab_lat, "fab_min_count": fab_min, "exempt_tools": fab_exempt}),
         (detect_handoff_schema_break,    {"handoff_pairs": handoff_pairs}),
         (detect_error_misinterpretation, {}),
     ]:
