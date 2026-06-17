@@ -622,12 +622,22 @@ def _slope(values: list[float]) -> float:
     return num / den if den else 0.0
 
 
+# ── Removed: trading-specific quality pattern detectors ──────────────────────
+# detect_grounding_failure, detect_coherence_break, detect_quality_cascade,
+# detect_silent_degradation, and run_quality_detectors have been removed.
+# These patterns are handled server-side by Argus's computeAndStoreAttribution()
+# and quality drift detection — no duplication needed in the SDK.
+#
+# If you need proactive quality trending for a custom pipeline, configure
+# Quality Dimensions in Argus Settings and Argus will compute drift automatically.
+
 def detect_grounding_failure(
     session: dict,
     sessions_history: list[dict],
     evals_by_session: dict[str, list],
 ) -> Incident | None:
-    """Fires when research.data_grounding < 0.40 for 3 consecutive sessions."""
+    """Removed — handled by Argus server-side. Returns None for backwards compatibility."""
+    return None
     window = sessions_history[-GROUNDING_FAILURE_WINDOW:]
     if len(window) < GROUNDING_FAILURE_WINDOW:
         return None
@@ -667,193 +677,21 @@ def detect_grounding_failure(
     )
 
 
-def detect_coherence_break(
-    session: dict,
-    sessions_history: list[dict],
-    evals_by_session: dict[str, list],
-) -> Incident | None:
-    """Fires when orchestrator.decision_consistency < 0.50 in the current session."""
-    sid   = session["id"]
-    score = _qscore(evals_by_session.get(sid, []), "orchestrator_quality", "decision_consistency")
-    if score is None or score >= COHERENCE_BREAK_THRESHOLD:
-        return None
+def detect_coherence_break(*_args, **_kwargs) -> None:
+    """Removed — handled by Argus server-side. Returns None for backwards compatibility."""
+    return None
 
-    return Incident(
-        session_id    = sid,
-        pattern_name  = "Proactive: Coherence Break",
-        severity      = "critical",
-        root_cause    = (
-            f"orchestrator.decision_consistency scored {score:.2f} "
-            f"(threshold {COHERENCE_BREAK_THRESHOLD}). "
-            f"The final trade decision does not align with research and risk agent outputs."
-        ),
-        call_stack    = [],
-        failed_evals  = [
-            {"agent": "orchestrator_quality", "eval_name": "decision_consistency",
-             "score": round(score, 3), "threshold": COHERENCE_BREAK_THRESHOLD}
-        ],
-        cost_wasted   = float(session.get("total_cost_usd") or 0),
-        tokens_wasted = 0,
-        fix_suggestion = (
-            "Add a consistency check in the orchestrator prompt: the final decision must "
-            "reference specific research findings and risk verdicts. Use a structured "
-            "handoff format so the orchestrator cannot ignore upstream outputs."
-        ),
-    )
+def detect_quality_cascade(*_args, **_kwargs) -> None:
+    """Removed — handled by Argus server-side. Returns None for backwards compatibility."""
+    return None
 
+def detect_silent_degradation(*_args, **_kwargs) -> None:
+    """Removed — handled by Argus server-side. Returns None for backwards compatibility."""
+    return None
 
-def detect_quality_cascade(
-    session: dict,
-    sessions_history: list[dict],
-    evals_by_session: dict[str, list],
-) -> Incident | None:
-    """Fires when 3+ quality dimensions decline > 0.20 over the last 5 sessions."""
-    window = sessions_history[-CASCADE_WINDOW:]
-    if len(window) < 3:
-        return None
-
-    declining: list[dict] = []
-    for agent, dim in _CASCADE_DIMS:
-        vals = [
-            sc for s in window
-            for sc in [_qscore(evals_by_session.get(s["id"], []), agent, dim)]
-            if sc is not None
-        ]
-        if len(vals) < 3:
-            continue
-        drop = vals[0] - vals[-1]
-        if drop >= CASCADE_DROP:
-            declining.append({
-                "agent": agent, "dim": dim,
-                "drop": round(drop, 3), "first": round(vals[0], 3), "last": round(vals[-1], 3),
-            })
-
-    if len(declining) < CASCADE_MIN_DIMS:
-        return None
-
-    severity    = "critical" if len(declining) >= 5 else "warning"
-    dim_summary = "; ".join(
-        f"{d['agent'].replace('_quality','')}.{d['dim']} "
-        f"({d['first']:.2f}→{d['last']:.2f})"
-        for d in declining[:4]
-    )
-    return Incident(
-        session_id    = session["id"],
-        pattern_name  = "Proactive: Quality Cascade",
-        severity      = severity,
-        root_cause    = (
-            f"{len(declining)} quality dimensions declined >{CASCADE_DROP} over the last "
-            f"{len(window)} sessions. Degrading: {dim_summary}"
-            f"{'...' if len(declining) > 4 else ''}. "
-            f"Systemic degradation across agents — not an isolated bad session."
-        ),
-        call_stack    = [],
-        failed_evals  = [
-            {"agent": d["agent"], "eval_name": d["dim"],
-             "score": d["last"], "threshold": round(d["first"] - CASCADE_DROP, 3)}
-            for d in declining
-        ],
-        cost_wasted   = 0.0,
-        tokens_wasted = 0,
-        fix_suggestion = (
-            "Review agent prompts for each degrading dimension. "
-            "Check for recent changes to market data quality, model version, or tool schemas. "
-            "Run a manual quality review of the last 3 sessions before the next trading session."
-        ),
-    )
-
-
-def detect_silent_degradation(
-    session: dict,
-    sessions_history: list[dict],
-    evals_by_session: dict[str, list],
-) -> Incident | None:
-    """Fires when composite quality is declining while operational evals stay stable."""
-    window = sessions_history[-DEGRADATION_WINDOW:]
-    if len(window) < 3:
-        return None
-
-    composites: list[float] = []
-    op_rates:   list[float] = []
-    for s in window:
-        evals = evals_by_session.get(s["id"], [])
-        comp_scores = [
-            float(e["score"]) for e in evals
-            if e.get("eval_name") == "composite_score"
-            and (e.get("agent") or "").endswith("_quality")
-            and e.get("score") is not None
-        ]
-        op_evals = [
-            e for e in evals
-            if not (e.get("agent") or "").endswith("_quality")
-            and e.get("agent") not in ("business",)
-        ]
-        if not comp_scores:
-            continue
-        composites.append(statistics.mean(comp_scores))
-        if op_evals:
-            op_rates.append(
-                sum(1 for e in op_evals if e.get("passed", False)) / len(op_evals)
-            )
-
-    if len(composites) < 3:
-        return None
-
-    sl = _slope(composites)
-    if sl >= DEGRADATION_SLOPE_THRESHOLD:
-        return None
-
-    op_stable = (statistics.mean(op_rates) >= DEGRADATION_OP_FLOOR) if op_rates else True
-    if not op_stable:
-        return None
-
-    severity = "warning" if composites[-1] < 0.60 else "info"
-    return Incident(
-        session_id    = session["id"],
-        pattern_name  = "Proactive: Silent Degradation",
-        severity      = severity,
-        root_cause    = (
-            f"Composite quality declining at {sl:.3f}/session over the last {len(composites)} "
-            f"sessions (latest: {composites[-1]:.2f}). Operational evals are stable. "
-            f"Quality is eroding quietly before any structural failure."
-        ),
-        call_stack    = [],
-        failed_evals  = [
-            {"agent": a, "eval_name": "composite_score",
-             "score": round(composites[-1], 3), "threshold": 0.60}
-            for a in ["research_quality", "risk_quality",
-                      "orchestrator_quality", "session_quality"]
-        ],
-        cost_wasted   = 0.0,
-        tokens_wasted = 0,
-        fix_suggestion = (
-            "Manual review of recent session outputs is needed now. "
-            "Check for prompt drift, model version changes, or degrading market data quality. "
-            "If trend continues 2 more sessions, escalate to critical."
-        ),
-    )
-
-
-def run_quality_detectors(
-    session: dict,
-    sessions_history: list[dict],
-    evals_by_session: dict[str, list],
-) -> list[Incident]:
-    """Run all Q3 proactive quality pattern detectors."""
-    incidents: list[Incident] = []
-    for detector in [
-        detect_grounding_failure,
-        detect_coherence_break,
-        detect_quality_cascade,
-        detect_silent_degradation,
-    ]:
-        try:
-            result = detector(session, sessions_history, evals_by_session)
-            if result:
-                incidents.append(result)
-        except Exception:
-            pass
-    return incidents
+def run_quality_detectors(*_args, **_kwargs) -> list:
+    """Removed — handled by Argus server-side. Returns empty list for backwards compatibility."""
+    return []
 
 
 def compute_shadow_cb_fires(
